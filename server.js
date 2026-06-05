@@ -152,47 +152,64 @@ server.tool("get_financials", "Get revenue summary for a date range",
   }
 );
 
-server.tool("get_reviews", "Get guest reviews for your listings",
+server.tool("get_reviews", "Get guest reviews filtered by date range, rating, or listing",
   {
     listingId:     z.number().optional().describe("Filter by listing ID"),
     reservationId: z.number().optional().describe("Filter by reservation ID"),
     rating:        z.number().optional().describe("Filter by star rating (1-5)"),
-    limit:         z.number().optional().describe("Max results (default 20)"),
+    dateFrom:      z.string().optional().describe("Reviews submitted from this date YYYY-MM-DD"),
+    dateTo:        z.string().optional().describe("Reviews submitted up to this date YYYY-MM-DD"),
+    limit:         z.number().optional().describe("Max results (default 50)"),
     offset:        z.number().optional().describe("Pagination offset"),
   },
-  async ({ listingId, reservationId, rating, limit = 20, offset = 0 }) => {
+  async ({ listingId, reservationId, rating, dateFrom, dateTo, limit = 50, offset = 0 }) => {
     const params = new URLSearchParams({ limit, offset });
     if (listingId)     params.set("listingId", listingId);
     if (reservationId) params.set("reservationId", reservationId);
     if (rating)        params.set("rating", rating);
+    if (dateFrom)      params.set("submittedAtStart", dateFrom);
+    if (dateTo)        params.set("submittedAtEnd", dateTo);
 
     const data = await hostawayFetch(`/reviews?${params}`);
-    const reviews = data.result.map((r) => ({
-      id:              r.id,
-      listingId:       r.listingId,
-      reservationId:   r.reservationId,
-      guestName:       r.reviewerName,
-      rating:          r.rating,
-      publicReview:    r.publicReview,
-      privateReview:   r.privateReview,
-      categoryRatings: r.categoryRatings,
-      submittedAt:     r.submittedAt,
-      channel:         r.channelName,
+    let reviews = data.result;
+
+    // Client-side date filter as fallback
+    if (dateFrom || dateTo) {
+      const from = dateFrom ? new Date(dateFrom) : null;
+      const to   = dateTo   ? new Date(dateTo + "T23:59:59Z") : null;
+      reviews = reviews.filter(r => {
+        if (!r.submittedAt) return false;
+        const d = new Date(r.submittedAt);
+        if (from && d < from) return false;
+        if (to   && d > to)   return false;
+        return true;
+      });
+    }
+
+    const mapped = reviews.map((r) => ({
+      id:            r.id,
+      listingId:     r.listingId,
+      reservationId: r.reservationId,
+      guestName:     r.reviewerName,
+      rating:        r.rating,
+      publicReview:  r.publicReview,
+      submittedAt:   r.submittedAt,
+      channel:       r.channelName,
     }));
 
-    // Calculate average rating
-    const avg = reviews.length
-      ? (reviews.reduce((s, r) => s + (r.rating || 0), 0) / reviews.length).toFixed(2)
+    const avg = mapped.filter(r => r.rating).length
+      ? (mapped.reduce((s, r) => s + (r.rating || 0), 0) / mapped.filter(r => r.rating).length).toFixed(2)
       : "N/A";
 
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({ total: data.count, averageRating: avg, reviews }, null, 2),
+        text: JSON.stringify({ totalInDB: data.count, returned: mapped.length, averageRating: avg, reviews: mapped }, null, 2),
       }],
     };
   }
 );
+
 
 server.tool("get_review_summary", "Get a summary of ratings across all your listings",
   { listingId: z.number().optional().describe("Filter by listing ID (optional)") },
