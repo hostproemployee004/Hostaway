@@ -1,0 +1,15 @@
+{
+  "name": "hostaway-mcp",
+  "version": "1.0.0",
+  "description": "Hostaway MCP Server for Claude",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "zod": "^3.25.76"
+  }
+}
