@@ -152,6 +152,92 @@ server.tool("get_financials", "Get revenue summary for a date range",
   }
 );
 
+server.tool("get_reviews", "Get guest reviews for your listings",
+  {
+    listingId:     z.number().optional().describe("Filter by listing ID"),
+    reservationId: z.number().optional().describe("Filter by reservation ID"),
+    rating:        z.number().optional().describe("Filter by star rating (1-5)"),
+    limit:         z.number().optional().describe("Max results (default 20)"),
+    offset:        z.number().optional().describe("Pagination offset"),
+  },
+  async ({ listingId, reservationId, rating, limit = 20, offset = 0 }) => {
+    const params = new URLSearchParams({ limit, offset });
+    if (listingId)     params.set("listingId", listingId);
+    if (reservationId) params.set("reservationId", reservationId);
+    if (rating)        params.set("rating", rating);
+
+    const data = await hostawayFetch(`/reviews?${params}`);
+    const reviews = data.result.map((r) => ({
+      id:              r.id,
+      listingId:       r.listingId,
+      reservationId:   r.reservationId,
+      guestName:       r.reviewerName,
+      rating:          r.rating,
+      publicReview:    r.publicReview,
+      privateReview:   r.privateReview,
+      categoryRatings: r.categoryRatings,
+      submittedAt:     r.submittedAt,
+      channel:         r.channelName,
+    }));
+
+    // Calculate average rating
+    const avg = reviews.length
+      ? (reviews.reduce((s, r) => s + (r.rating || 0), 0) / reviews.length).toFixed(2)
+      : "N/A";
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ total: data.count, averageRating: avg, reviews }, null, 2),
+      }],
+    };
+  }
+);
+
+server.tool("get_review_summary", "Get a summary of ratings across all your listings",
+  { listingId: z.number().optional().describe("Filter by listing ID (optional)") },
+  async ({ listingId }) => {
+    const params = new URLSearchParams({ limit: 100 });
+    if (listingId) params.set("listingId", listingId);
+
+    const data = await hostawayFetch(`/reviews?${params}`);
+    const reviews = data.result;
+
+    if (!reviews.length) {
+      return { content: [{ type: "text", text: "No reviews found." }] };
+    }
+
+    const summary = {
+      totalReviews: data.count,
+      averageRating: (reviews.reduce((s, r) => s + (r.rating || 0), 0) / reviews.length).toFixed(2),
+      ratingBreakdown: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
+      byChannel: {},
+      recentReviews: reviews.slice(0, 5).map(r => ({
+        guest: r.reviewerName,
+        rating: r.rating,
+        review: r.publicReview,
+        date: r.submittedAt,
+      })),
+    };
+
+    reviews.forEach(r => {
+      if (r.rating) summary.ratingBreakdown[r.rating] = (summary.ratingBreakdown[r.rating] || 0) + 1;
+      if (!summary.byChannel[r.channelName]) summary.byChannel[r.channelName] = { count: 0, totalRating: 0 };
+      summary.byChannel[r.channelName].count++;
+      summary.byChannel[r.channelName].totalRating += r.rating || 0;
+    });
+
+    // Average per channel
+    Object.keys(summary.byChannel).forEach(ch => {
+      const c = summary.byChannel[ch];
+      c.averageRating = (c.totalRating / c.count).toFixed(2);
+      delete c.totalRating;
+    });
+
+    return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+  }
+);
+
 // ─── EXPRESS APP ──────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
