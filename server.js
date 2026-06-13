@@ -11,11 +11,11 @@ const BASE_URL            = "https://api.hostaway.com/v1";
 const SERVER_URL          = process.env.SERVER_URL || `http://localhost:${PORT}`;
 
 if (!HOSTAWAY_ACCOUNT_ID || !HOSTAWAY_API_KEY) {
-  console.error("❌  Set HOSTAWAY_ACCOUNT_ID and HOSTAWAY_API_KEY env vars first.");
+  console.error("Set HOSTAWAY_ACCOUNT_ID and HOSTAWAY_API_KEY env vars.");
   process.exit(1);
 }
 
-// ─── HOSTAWAY AUTH ────────────────────────────────────────────────────────────
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
 let cachedToken = null;
 let tokenExpiry = 0;
 
@@ -25,10 +25,10 @@ async function getAccessToken() {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      grant_type:    "client_credentials",
-      client_id:     HOSTAWAY_ACCOUNT_ID,
+      grant_type: "client_credentials",
+      client_id: HOSTAWAY_ACCOUNT_ID,
       client_secret: HOSTAWAY_API_KEY,
-      scope:         "general",
+      scope: "general",
     }),
   });
   if (!res.ok) throw new Error(`Auth failed: ${res.status} ${await res.text()}`);
@@ -53,19 +53,44 @@ async function hostawayFetch(path, options = {}) {
   return json;
 }
 
-// Helper: client-side date filter on any array of objects
-function filterByDate(arr, dateField, dateFrom, dateTo) {
-  if (!dateFrom && !dateTo) return arr;
+// ─── FETCH ALL (auto-paginate) ────────────────────────────────────────────────
+// Fetches every page until all records are retrieved.
+// Pass filterFn to filter records on each page (saves memory).
+async function fetchAll(endpoint, extraParams = {}, filterFn = null) {
+  const BATCH = 100;
+  let offset  = 0;
+  let total   = null;
+  let all     = [];
+
+  while (true) {
+    const params = new URLSearchParams({ limit: BATCH, offset, ...extraParams });
+    const data   = await hostawayFetch(`${endpoint}?${params}`);
+    total        = data.count;
+
+    const batch = data.result || [];
+    if (!batch.length) break;
+
+    const keep = filterFn ? batch.filter(filterFn) : batch;
+    all.push(...keep);
+
+    offset += BATCH;
+    if (offset >= total) break;
+  }
+
+  return { total, records: all };
+}
+
+// ─── DATE HELPERS ─────────────────────────────────────────────────────────────
+function dateFilter(dateFrom, dateTo) {
   const from = dateFrom ? new Date(dateFrom) : null;
   const to   = dateTo   ? new Date(dateTo + "T23:59:59Z") : null;
-  return arr.filter(item => {
-    const val = item[dateField];
+  return (val) => {
     if (!val) return false;
     const d = new Date(val);
     if (from && d < from) return false;
     if (to   && d > to)   return false;
     return true;
-  });
+  };
 }
 
 // ─── MCP SERVER ───────────────────────────────────────────────────────────────
@@ -73,64 +98,65 @@ const server = new McpServer({ name: "hostaway-mcp", version: "1.0.0" });
 
 // ── LIST LISTINGS ─────────────────────────────────────────────────────────────
 server.tool("list_listings",
-  "Get all property listings. Filter by creation date or active status.",
-  {
-    dateFrom:  z.string().optional().describe("Listings created from this date (YYYY-MM-DD)"),
-    dateTo:    z.string().optional().describe("Listings created up to this date (YYYY-MM-DD)"),
-    status:    z.enum(["active","inactive"]).optional().describe("Filter by listing status"),
-    limit:     z.number().optional().describe("Max results (default 50)"),
-    offset:    z.number().optional().describe("Pagination offset"),
-  },
-  async ({ dateFrom, dateTo, status, limit = 50, offset = 0 }) => {
-    const params = new URLSearchParams({ limit, offset });
-    if (status) params.set("status", status);
+  "Get ALL property listings. Fetches every page automatically.",
+  { status: z.enum(["active","inactive"]).optional() },
+  async ({ status }) => {
+    const params = {};
+    if (status) params.status = status;
 
-    const data = await hostawayFetch(`/listings?${params}`);
-    let listings = data.result.map((l) => ({
-      id:          l.id,
-      name:        l.name,
-      address:     l.address,
-      bedrooms:    l.bedroomsNumber,
-      bathrooms:   l.bathroomsNumber,
-      capacity:    l.personCapacity,
-      status:      l.status,
-      createdAt:   l.insertedOn,
-      updatedAt:   l.updatedOn,
+    const { total, records } = await fetchAll("/listings", params);
+    const listings = records.map(l => ({
+      id:        l.id,
+      name:      l.name,
+      address:   l.address,
+      bedrooms:  l.bedroomsNumber,
+      bathrooms: l.bathroomsNumber,
+      capacity:  l.personCapacity,
+      status:    l.status,
     }));
 
-    // Client-side date filter on createdAt
-    listings = filterByDate(listings, "createdAt", dateFrom, dateTo);
-
-    return { content: [{ type: "text", text: JSON.stringify({ total: data.count, returned: listings.length, listings }, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ totalInHostaway: total, returned: listings.length, listings }, null, 2) }] };
   }
 );
 
 // ── GET RESERVATIONS ──────────────────────────────────────────────────────────
 server.tool("get_reservations",
-  "Get reservations filtered by check-in date range, booking date, status, channel, or listing.",
+  "Get ALL reservations for a date range. Automatically fetches every page so no data is missed. Use checkInFrom/checkInTo for arrival dates.",
   {
-    checkInFrom:   z.string().optional().describe("Check-in from date (YYYY-MM-DD)"),
-    checkInTo:     z.string().optional().describe("Check-in to date (YYYY-MM-DD)"),
-    checkOutFrom:  z.string().optional().describe("Check-out from date (YYYY-MM-DD)"),
-    checkOutTo:    z.string().optional().describe("Check-out to date (YYYY-MM-DD)"),
-    bookedFrom:    z.string().optional().describe("Booking created from date (YYYY-MM-DD)"),
-    bookedTo:      z.string().optional().describe("Booking created to date (YYYY-MM-DD)"),
-    status:        z.enum(["new","modified","cancelled","ownerStay","inquiry","tentative","blocked"]).optional(),
-    channelName:   z.string().optional().describe("Filter by channel e.g. airbnb, booking.com"),
-    listingId:     z.number().optional().describe("Filter by listing ID"),
-    limit:         z.number().optional().describe("Max results (default 50)"),
+    checkInFrom:  z.string().optional().describe("Check-in from date YYYY-MM-DD"),
+    checkInTo:    z.string().optional().describe("Check-in to date YYYY-MM-DD"),
+    checkOutFrom: z.string().optional().describe("Check-out from date YYYY-MM-DD"),
+    checkOutTo:   z.string().optional().describe("Check-out to date YYYY-MM-DD"),
+    bookedFrom:   z.string().optional().describe("Booking created from date YYYY-MM-DD"),
+    bookedTo:     z.string().optional().describe("Booking created to date YYYY-MM-DD"),
+    status:       z.enum(["new","modified","cancelled","ownerStay","inquiry","tentative","blocked"]).optional(),
+    channelName:  z.string().optional().describe("Filter by channel e.g. airbnb"),
+    listingId:    z.number().optional().describe("Filter by listing ID"),
   },
-  async ({ checkInFrom, checkInTo, checkOutFrom, checkOutTo, bookedFrom, bookedTo, status, channelName, listingId, limit = 50 }) => {
-    const params = new URLSearchParams({ limit });
-    if (status)      params.set("status", status);
-    if (listingId)   params.set("listingId", listingId);
-    if (checkInFrom) params.set("startDate", checkInFrom);
-    if (checkInTo)   params.set("endDate", checkInTo);
-    if (bookedFrom)  params.set("createdAfter", bookedFrom);
-    if (bookedTo)    params.set("createdBefore", bookedTo);
+  async ({ checkInFrom, checkInTo, checkOutFrom, checkOutTo, bookedFrom, bookedTo, status, channelName, listingId }) => {
+    const params = {};
+    if (status)      params.status      = status;
+    if (listingId)   params.listingId   = listingId;
+    if (checkInFrom) params.startDate   = checkInFrom;
+    if (checkInTo)   params.endDate     = checkInTo;
+    if (bookedFrom)  params.createdAfter  = bookedFrom;
+    if (bookedTo)    params.createdBefore = bookedTo;
 
-    const data = await hostawayFetch(`/reservations?${params}`);
-    let reservations = data.result.map((r) => ({
+    // Client-side checkout filter
+    const checkOutFilter = (checkOutFrom || checkOutTo)
+      ? dateFilter(checkOutFrom, checkOutTo)
+      : null;
+    const channelFilter = channelName
+      ? (r) => r.channelName?.toLowerCase().includes(channelName.toLowerCase())
+      : null;
+
+    const { total, records } = await fetchAll("/reservations", params, (r) => {
+      if (checkOutFilter && !checkOutFilter(r.departureDate)) return false;
+      if (channelFilter  && !channelFilter(r)) return false;
+      return true;
+    });
+
+    const reservations = records.map(r => ({
       id:          r.id,
       listingId:   r.listingMapId,
       listingName: r.listingName,
@@ -139,20 +165,15 @@ server.tool("get_reservations",
       checkIn:     r.arrivalDate,
       checkOut:    r.departureDate,
       bookedOn:    r.insertedOn,
-      updatedOn:   r.updatedOn,
       nights:      r.nights,
-      guests:      r.adults + (r.children || 0),
+      guests:      (r.adults || 0) + (r.children || 0),
       status:      r.status,
       channel:     r.channelName,
       totalPrice:  r.totalPrice,
       currency:    r.currency,
     }));
 
-    // Client-side filters
-    if (checkOutFrom || checkOutTo) reservations = filterByDate(reservations, "checkOut", checkOutFrom, checkOutTo);
-    if (channelName) reservations = reservations.filter(r => r.channel?.toLowerCase().includes(channelName.toLowerCase()));
-
-    return { content: [{ type: "text", text: JSON.stringify({ total: data.count, returned: reservations.length, reservations }, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ totalInHostaway: total, returned: reservations.length, reservations }, null, 2) }] };
   }
 );
 
@@ -168,35 +189,38 @@ server.tool("get_reservation_detail",
 
 // ── GET CONVERSATIONS ─────────────────────────────────────────────────────────
 server.tool("get_conversations",
-  "Get guest conversations/messages, filtered by date or listing.",
+  "Get ALL guest conversations for a date range. Fetches every page automatically.",
   {
     listingId:     z.number().optional().describe("Filter by listing ID"),
     reservationId: z.number().optional().describe("Filter by reservation ID"),
-    dateFrom:      z.string().optional().describe("Conversations from this date (YYYY-MM-DD)"),
-    dateTo:        z.string().optional().describe("Conversations up to this date (YYYY-MM-DD)"),
-    limit:         z.number().optional().describe("Max results (default 50)"),
+    dateFrom:      z.string().optional().describe("Updated from this date YYYY-MM-DD"),
+    dateTo:        z.string().optional().describe("Updated up to this date YYYY-MM-DD"),
   },
-  async ({ listingId, reservationId, dateFrom, dateTo, limit = 50 }) => {
-    const params = new URLSearchParams({ limit });
-    if (listingId)     params.set("listingId", listingId);
-    if (reservationId) params.set("reservationId", reservationId);
+  async ({ listingId, reservationId, dateFrom, dateTo }) => {
+    const params = {};
+    if (listingId)     params.listingId     = listingId;
+    if (reservationId) params.reservationId = reservationId;
 
-    const data = await hostawayFetch(`/conversations?${params}`);
-    let conversations = data.result.map(c => ({
+    const inRange = (dateFrom || dateTo) ? dateFilter(dateFrom, dateTo) : null;
+
+    const { total, records } = await fetchAll("/conversations", params, (c) => {
+      if (inRange && !inRange(c.updatedOn || c.insertedOn)) return false;
+      return true;
+    });
+
+    const conversations = records.map(c => ({
       id:            c.id,
       listingId:     c.listingId,
+      listingName:   c.listingName,
       reservationId: c.reservationId,
       guestName:     c.guestName,
       channel:       c.channelName,
       lastMessage:   c.lastMessage,
-      createdAt:     c.insertedOn,
       updatedAt:     c.updatedOn,
+      createdAt:     c.insertedOn,
     }));
 
-    // Client-side date filter on updatedAt
-    conversations = filterByDate(conversations, "updatedAt", dateFrom, dateTo);
-
-    return { content: [{ type: "text", text: JSON.stringify({ total: data.count, returned: conversations.length, conversations }, null, 2) }] };
+    return { content: [{ type: "text", text: JSON.stringify({ totalInHostaway: total, returned: conversations.length, conversations }, null, 2) }] };
   }
 );
 
@@ -208,17 +232,17 @@ server.tool("send_message",
     const data = await hostawayFetch(`/conversations/${conversationId}/messages`, {
       method: "POST", body: JSON.stringify({ body: message }),
     });
-    return { content: [{ type: "text", text: `✅ Message sent! ID: ${data.result?.id}` }] };
+    return { content: [{ type: "text", text: `Message sent! ID: ${data.result?.id}` }] };
   }
 );
 
 // ── GET CALENDAR ──────────────────────────────────────────────────────────────
 server.tool("get_calendar",
-  "Get calendar availability for a listing between two dates",
+  "Get availability calendar for a listing. To check which properties are free on specific dates, use get_available_listings instead.",
   {
-    listingId:  z.number().describe("Listing ID"),
-    dateFrom:   z.string().describe("Start date (YYYY-MM-DD)"),
-    dateTo:     z.string().describe("End date (YYYY-MM-DD)"),
+    listingId: z.number().describe("Listing ID"),
+    dateFrom:  z.string().describe("Start date YYYY-MM-DD"),
+    dateTo:    z.string().describe("End date YYYY-MM-DD"),
   },
   async ({ listingId, dateFrom, dateTo }) => {
     const data = await hostawayFetch(`/listings/${listingId}/calendar?startDate=${dateFrom}&endDate=${dateTo}`);
@@ -226,50 +250,100 @@ server.tool("get_calendar",
   }
 );
 
+// ── GET AVAILABLE LISTINGS ────────────────────────────────────────────────────
+server.tool("get_available_listings",
+  "Find which properties are available (not booked) for specific dates. Checks ALL reservations automatically.",
+  {
+    dateFrom: z.string().describe("Start date to check YYYY-MM-DD"),
+    dateTo:   z.string().describe("End date to check YYYY-MM-DD"),
+  },
+  async ({ dateFrom, dateTo }) => {
+    const checkFrom = new Date(dateFrom);
+    const checkTo   = new Date(dateTo);
+
+    // Fetch all listings and all reservations in parallel
+    const [listingsResult, reservationsResult] = await Promise.all([
+      fetchAll("/listings", {}),
+      fetchAll("/reservations", { startDate: dateFrom, endDate: dateTo }),
+    ]);
+
+    const allListings     = listingsResult.records;
+    const allReservations = reservationsResult.records;
+
+    // Find booked listing IDs in the date range
+    const bookedIds = new Set();
+    allReservations.forEach(r => {
+      if (["cancelled", "inquiry"].includes(r.status)) return;
+      const resIn  = new Date(r.arrivalDate);
+      const resOut = new Date(r.departureDate);
+      // Overlaps if: resIn < checkTo AND resOut > checkFrom
+      if (resIn < checkTo && resOut > checkFrom) {
+        bookedIds.add(r.listingMapId);
+      }
+    });
+
+    const available = allListings
+      .filter(l => l.status === "active" && !bookedIds.has(l.id))
+      .map(l => ({ id: l.id, name: l.name, bedrooms: l.bedroomsNumber, capacity: l.personCapacity }));
+
+    const booked = allListings
+      .filter(l => bookedIds.has(l.id))
+      .map(l => ({ id: l.id, name: l.name }));
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          period: { from: dateFrom, to: dateTo },
+          availableCount: available.length,
+          bookedCount:    booked.length,
+          available,
+          booked,
+        }, null, 2),
+      }],
+    };
+  }
+);
+
 // ── GET FINANCIALS ────────────────────────────────────────────────────────────
 server.tool("get_financials",
-  "Get revenue and booking summary for a date range, broken down by channel and listing",
+  "Get complete revenue summary for a date range. Fetches ALL reservations automatically, no data missed.",
   {
-    dateFrom:  z.string().describe("Start date (YYYY-MM-DD)"),
-    dateTo:    z.string().describe("End date (YYYY-MM-DD)"),
-    dateType:  z.enum(["checkIn","booked"]).optional().describe("Whether dates refer to check-in date or booking date (default: checkIn)"),
+    dateFrom:  z.string().describe("Start date YYYY-MM-DD"),
+    dateTo:    z.string().describe("End date YYYY-MM-DD"),
+    dateType:  z.enum(["checkIn","booked"]).optional().describe("Filter by check-in date or booking date, default checkIn"),
     listingId: z.number().optional().describe("Filter by listing ID"),
   },
   async ({ dateFrom, dateTo, dateType = "checkIn", listingId }) => {
-    const params = new URLSearchParams({ limit: 100 });
-    if (dateType === "checkIn") {
-      params.set("startDate", dateFrom);
-      params.set("endDate", dateTo);
-    } else {
-      params.set("createdAfter", dateFrom);
-      params.set("createdBefore", dateTo);
-    }
-    if (listingId) params.set("listingId", listingId);
+    const params = {};
+    if (dateType === "checkIn") { params.startDate = dateFrom; params.endDate = dateTo; }
+    else { params.createdAfter = dateFrom; params.createdBefore = dateTo; }
+    if (listingId) params.listingId = listingId;
 
-    const data = await hostawayFetch(`/reservations?${params}`);
-    const reservations = data.result.filter(r => r.status !== "cancelled");
+    const { total, records } = await fetchAll("/reservations", params,
+      r => r.status !== "cancelled"
+    );
 
     const summary = {
-      period:            { from: dateFrom, to: dateTo, type: dateType },
-      totalReservations: reservations.length,
-      totalRevenue:      reservations.reduce((s, r) => s + (parseFloat(r.totalPrice) || 0), 0).toFixed(2),
-      currency:          reservations[0]?.currency || "USD",
-      byChannel:         {},
-      byListing:         {},
+      period: { from: dateFrom, to: dateTo, type: dateType },
+      totalReservationsScanned: total,
+      totalActiveReservations: records.length,
+      totalRevenue: records.reduce((s, r) => s + (parseFloat(r.totalPrice) || 0), 0).toFixed(2),
+      currency: records[0]?.currency || "USD",
+      byChannel: {},
+      byListing: {},
     };
 
-    reservations.forEach(r => {
-      // By channel
+    records.forEach(r => {
       const ch = r.channelName || "Direct";
       if (!summary.byChannel[ch]) summary.byChannel[ch] = { count: 0, revenue: 0 };
       summary.byChannel[ch].count++;
-      summary.byChannel[ch].revenue = (parseFloat(summary.byChannel[ch].revenue) + (parseFloat(r.totalPrice) || 0)).toFixed(2);
+      summary.byChannel[ch].revenue = +(summary.byChannel[ch].revenue + (parseFloat(r.totalPrice) || 0)).toFixed(2);
 
-      // By listing
-      const ln = r.listingName || r.listingMapId;
+      const ln = r.listingName || `Listing ${r.listingMapId}`;
       if (!summary.byListing[ln]) summary.byListing[ln] = { count: 0, revenue: 0 };
       summary.byListing[ln].count++;
-      summary.byListing[ln].revenue = (parseFloat(summary.byListing[ln].revenue) + (parseFloat(r.totalPrice) || 0)).toFixed(2);
+      summary.byListing[ln].revenue = +(summary.byListing[ln].revenue + (parseFloat(r.totalPrice) || 0)).toFixed(2);
     });
 
     return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
@@ -278,64 +352,30 @@ server.tool("get_financials",
 
 // ── GET REVIEWS ───────────────────────────────────────────────────────────────
 server.tool("get_reviews",
-  "Get guest reviews filtered by date, rating, listing. Paginates automatically to find matches.",
+  "Get guest reviews. Automatically paginates all pages to find matches.",
   {
     listingId:  z.number().optional().describe("Filter by listing ID"),
     rating:     z.number().optional().describe("Filter by star rating 1-5"),
-    dateFrom:   z.string().optional().describe("Reviews submitted from YYYY-MM-DD"),
-    dateTo:     z.string().optional().describe("Reviews submitted up to YYYY-MM-DD"),
-    guestOnly:  z.boolean().optional().describe("Only guest reviews with ratings, default true"),
-    maxResults: z.number().optional().describe("Max results to return, default 50"),
+    dateFrom:   z.string().optional().describe("Reviews from YYYY-MM-DD"),
+    dateTo:     z.string().optional().describe("Reviews up to YYYY-MM-DD"),
+    maxResults: z.number().optional().describe("Max results default 50"),
   },
-  async ({ listingId, rating, dateFrom, dateTo, guestOnly = true, maxResults = 50 }) => {
-    const from = dateFrom ? new Date(dateFrom) : null;
-    const to   = dateTo   ? new Date(dateTo + "T23:59:59Z") : null;
+  async ({ listingId, rating, dateFrom, dateTo, maxResults = 50 }) => {
+    const params = {};
+    if (listingId) params.listingId = listingId;
 
-    let matched = [];
-    let offset  = 0;
-    const batchSize = 100;
-    let totalInDB = 0;
-    let pagesScanned = 0;
-    let consecutiveEmpty = 0;
+    const inRange = (dateFrom || dateTo) ? dateFilter(dateFrom, dateTo) : null;
 
-    while (matched.length < maxResults && consecutiveEmpty < 5) {
-      const params = new URLSearchParams({ limit: batchSize, offset });
-      if (listingId) params.set("listingId", listingId);
+    const { total, records } = await fetchAll("/reviews", params, (r) => {
+      if (!r.rating && !r.submittedAt) return false; // skip host-written
+      if (inRange && !inRange(r.submittedAt)) return false;
+      if (rating && r.rating !== rating) return false;
+      return true;
+    });
 
-      const data = await hostawayFetch("/reviews?" + params.toString());
-      totalInDB = data.count;
-      pagesScanned++;
-
-      const batch = data.result || [];
-      if (!batch.length) break;
-
-      const filtered = batch.filter(r => {
-        if (guestOnly && !r.rating && !r.submittedAt) return false;
-        if (from || to) {
-          if (!r.submittedAt) return false;
-          const d = new Date(r.submittedAt);
-          if (from && d < from) return false;
-          if (to   && d > to)   return false;
-        }
-        if (rating && r.rating !== rating) return false;
-        return true;
-      });
-
-      if (filtered.length === 0) consecutiveEmpty++;
-      else consecutiveEmpty = 0;
-
-      matched.push(...filtered);
-      offset += batchSize;
-      if (offset >= totalInDB) break;
-    }
-
-    matched = matched.slice(0, maxResults);
-
-    const mapped = matched.map(r => ({
+    const reviews = records.slice(0, maxResults).map(r => ({
       id:            r.id,
-      listingId:     r.listingId,
       listingName:   r.listingName,
-      reservationId: r.reservationId,
       guestName:     r.reviewerName,
       rating:        r.rating,
       publicReview:  r.publicReview,
@@ -343,85 +383,15 @@ server.tool("get_reviews",
       channel:       r.channelName,
     }));
 
-    const rated = mapped.filter(r => r.rating);
-    const avg = rated.length
-      ? (rated.reduce((s, r) => s + r.rating, 0) / rated.length).toFixed(2)
+    const avg = reviews.filter(r => r.rating).length
+      ? (reviews.reduce((s, r) => s + (r.rating || 0), 0) / reviews.filter(r => r.rating).length).toFixed(2)
       : "N/A";
 
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify({
-          totalInDB, pagesScanned, returned: mapped.length,
-          averageRating: avg,
-          filters: { dateFrom, dateTo, rating, guestOnly },
-          reviews: mapped,
-        }, null, 2),
-      }],
-    };
+    return { content: [{ type: "text", text: JSON.stringify({ totalInHostaway: total, returned: reviews.length, averageRating: avg, reviews }, null, 2) }] };
   }
 );
 
-// ── GET REVIEW SUMMARY ────────────────────────────────────────────────────────
-server.tool("get_review_summary",
-  "Get an overall rating summary broken down by channel and listing, with optional date range",
-  {
-    listingId: z.number().optional().describe("Filter by listing ID"),
-    dateFrom:  z.string().optional().describe("Reviews submitted from (YYYY-MM-DD)"),
-    dateTo:    z.string().optional().describe("Reviews submitted up to (YYYY-MM-DD)"),
-  },
-  async ({ listingId, dateFrom, dateTo }) => {
-    const params = new URLSearchParams({ limit: 100 });
-    if (listingId) params.set("listingId", listingId);
-    if (dateFrom)  params.set("submittedAtStart", dateFrom);
-    if (dateTo)    params.set("submittedAtEnd", dateTo);
-
-    const data = await hostawayFetch(`/reviews?${params}`);
-    let reviews = filterByDate(data.result, "submittedAt", dateFrom, dateTo);
-
-    if (!reviews.length) return { content: [{ type: "text", text: "No reviews found for this period." }] };
-
-    const rated = reviews.filter(r => r.rating);
-    const summary = {
-      period:          { from: dateFrom || "all time", to: dateTo || "now" },
-      totalReviews:    reviews.length,
-      averageRating:   rated.length ? (rated.reduce((s, r) => s + r.rating, 0) / rated.length).toFixed(2) : "N/A",
-      ratingBreakdown: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
-      byChannel:       {},
-      byListing:       {},
-      recentReviews:   reviews.slice(0, 5).map(r => ({
-        guest: r.reviewerName, rating: r.rating,
-        review: r.publicReview, date: r.submittedAt, listing: r.listingName,
-      })),
-    };
-
-    reviews.forEach(r => {
-      if (r.rating) summary.ratingBreakdown[r.rating] = (summary.ratingBreakdown[r.rating] || 0) + 1;
-
-      const ch = r.channelName || "Direct";
-      if (!summary.byChannel[ch]) summary.byChannel[ch] = { count: 0, totalRating: 0 };
-      summary.byChannel[ch].count++;
-      summary.byChannel[ch].totalRating += r.rating || 0;
-
-      const ln = r.listingName || r.listingId;
-      if (!summary.byListing[ln]) summary.byListing[ln] = { count: 0, totalRating: 0 };
-      summary.byListing[ln].count++;
-      summary.byListing[ln].totalRating += r.rating || 0;
-    });
-
-    // Compute averages
-    [summary.byChannel, summary.byListing].forEach(group => {
-      Object.keys(group).forEach(k => {
-        group[k].averageRating = group[k].count ? (group[k].totalRating / group[k].count).toFixed(2) : "N/A";
-        delete group[k].totalRating;
-      });
-    });
-
-    return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
-  }
-);
-
-// ─── EXPRESS APP ──────────────────────────────────────────────────────────────
+// ─── EXPRESS ──────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
@@ -432,7 +402,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── OAUTH (required by Claude) ───────────────────────────────────────────────
+// OAuth (required by Claude)
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: SERVER_URL,
@@ -442,21 +412,18 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
     grant_types_supported: ["authorization_code"],
   });
 });
-
 app.get("/oauth/authorize", (req, res) => {
   const { redirect_uri, state } = req.query;
-  const code = "hostaway-auth-code-" + Date.now();
   const url = new URL(redirect_uri);
-  url.searchParams.set("code", code);
+  url.searchParams.set("code", "hostaway-code-" + Date.now());
   if (state) url.searchParams.set("state", state);
   res.redirect(url.toString());
 });
-
 app.post("/oauth/token", (req, res) => {
-  res.json({ access_token: "hostaway-mcp-token-" + Date.now(), token_type: "bearer", expires_in: 86400 });
+  res.json({ access_token: "hostaway-token-" + Date.now(), token_type: "bearer", expires_in: 86400 });
 });
 
-// ─── MCP ENDPOINT ─────────────────────────────────────────────────────────────
+// MCP
 app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => transport.close());
@@ -464,10 +431,5 @@ app.post("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get("/health", (_, res) => res.json({ status: "ok", server: "hostaway-mcp" }));
-
-app.listen(PORT, () => {
-  console.log(`\n🏠 Hostaway MCP Server running on port ${PORT}`);
-  console.log(`   MCP:    ${SERVER_URL}/mcp`);
-  console.log(`   Health: ${SERVER_URL}/health\n`);
-});
+app.get("/health", (_, res) => res.json({ status: "ok", tools: 9 }));
+app.listen(PORT, () => console.log(`Hostaway MCP running on port ${PORT}`));
