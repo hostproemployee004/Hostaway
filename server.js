@@ -413,47 +413,96 @@ server.tool("get_response_times",
           const raw = msgData.result || [];
           const messages = raw.sort((a, b) => new Date(a.insertedOn) - new Date(b.insertedOn));
 
-          // Try multiple field names Hostaway might use for sender role
+          // Hostaway messages use insertedOn as timestamp
+          // Sender detection: try all known field names
           const getRole = (msg) => {
-            if (msg.senderRole)  return msg.senderRole;
-            if (msg.type)        return msg.type;
-            if (msg.authorType)  return msg.authorType;
+            if (msg.senderRole === "guest" || msg.senderRole === "traveler") return "guest";
+            if (msg.senderRole === "host"  || msg.senderRole === "owner")    return "host";
+            if (msg.type === "guest" || msg.type === "traveler")             return "guest";
+            if (msg.type === "host"  || msg.type === "owner")                return "host";
+            if (msg.authorType === "guest")   return "guest";
+            if (msg.authorType === "host")    return "host";
             if (msg.direction === "incoming") return "guest";
             if (msg.direction === "outgoing") return "host";
             if (msg.isOutgoing === false)     return "guest";
             if (msg.isOutgoing === true)      return "host";
+            // If body exists and no role, use isFromHost flag
+            if (msg.isFromHost === false) return "guest";
+            if (msg.isFromHost === true)  return "host";
             return null;
           };
+
+          // Use insertedOn as the reliable timestamp (sentChannelDate is only on automated msgs)
+          const getTime = (msg) => msg.insertedOn || msg.createdAt || msg.sentChannelDate || null;
 
           let firstGuest = null;
           let firstHost  = null;
 
           for (const msg of messages) {
             const role = getRole(msg);
+            const time = getTime(msg);
+            if (!time) continue; // skip messages without timestamps
             if (!firstGuest && role === "guest") { firstGuest = msg; }
             else if (firstGuest && !firstHost && role === "host") { firstHost = msg; break; }
           }
 
           if (firstGuest && firstHost) {
-            const guestMsgDate = new Date(firstGuest.insertedOn);
+            const guestTime    = new Date(firstGuest.insertedOn);
+            const hostTime     = new Date(firstHost.insertedOn);
 
             // Only include if guest message falls within requested date range
-            if (guestMsgDate < from || guestMsgDate > to) {
-              return { _skipped: true, _reason: "guest message outside date range", conversationId: convo.id, guestMessageAt: firstGuest.insertedOn };
+            if (guestTime < from || guestTime > to) {
+              return { _skipped: true, _reason: "outside date range", conversationId: convo.id, guestMessageAt: firstGuest.insertedOn };
             }
 
-            const diffMin = Math.round((new Date(firstHost.insertedOn) - new Date(firstGuest.insertedOn)) / 60000);
+            const diffMin = Math.round((hostTime - guestTime) / 60000);
+
+            // Fetch reservation for stay dates
+            let checkIn = null, checkOut = null;
+            if (convo.reservationId) {
+              try {
+                const resData = await hostawayFetch("/reservations/" + convo.reservationId);
+                checkIn  = resData.result?.arrivalDate;
+                checkOut = resData.result?.departureDate;
+              } catch(e) {}
+            }
+
             return {
-              conversationId:   convo.id,
-              guestName:        convo.guestName,
-              listingName:      convo.listingName,
-              channel:          convo.channelName,
-              guestMessageAt:   firstGuest.insertedOn,
-              hostReplyAt:      firstHost.insertedOn,
-              responseTimeMin:  diffMin,
+              conversationId:    convo.id,
+              guestName:         convo.guestName,
+              apartmentName:     convo.listingName,
+              channel:           convo.channelName,
+              stayCheckIn:       checkIn,
+              stayCheckOut:      checkOut,
+              guestMessageAt:    firstGuest.insertedOn,
+              guestMessage:      firstGuest.body ? firstGuest.body.slice(0, 100) : null,
+              hostReplyAt:       firstHost.insertedOn,
+              responseTimeMin:   diffMin,
               responseTimeHuman: diffMin < 60 ? diffMin + " min" : Math.floor(diffMin/60) + "h " + (diffMin%60) + "m",
-              slow:             diffMin > slowThresholdMin,
+              slow:              diffMin > slowThresholdMin,
             };
+          }
+
+          // No reply found yet — guest message unanswered
+          if (firstGuest) {
+            const guestTime = new Date(firstGuest.insertedOn);
+            if (guestTime >= from && guestTime <= to) {
+              const waitMin = Math.round((new Date() - guestTime) / 60000);
+              return {
+                conversationId:   convo.id,
+                guestName:        convo.guestName,
+                apartmentName:    convo.listingName,
+                channel:          convo.channelName,
+                guestMessageAt:   firstGuest.insertedOn,
+                guestMessage:     firstGuest.body ? firstGuest.body.slice(0, 100) : null,
+                hostReplyAt:      null,
+                responseTimeMin:  null,
+                responseTimeHuman: "NOT REPLIED YET",
+                waitingMin:       waitMin,
+                slow:             true,
+                unanswered:       true,
+              };
+            }
           }
 
           // Debug: return raw sample so we can see the real field names
@@ -477,41 +526,59 @@ server.tool("get_response_times",
       });
     }
 
-    const times  = results.map(r => r.responseTimeMin).filter(t => t >= 0);
-    const avgMin = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
+    const answered   = results.filter(r => r.responseTimeMin !== null);
+    const unanswered = results.filter(r => r.unanswered);
+    const slow       = results.filter(r => r.slow);
+    const times      = answered.map(r => r.responseTimeMin).filter(t => t >= 0);
+    const avgMin     = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
+
+    const fmt = (m) => m === null ? "N/A" : m < 60 ? m + " min" : Math.floor(m/60) + "h " + (m%60) + "m";
 
     const byDay = {};
     results.forEach(r => {
       const day = r.guestMessageAt ? r.guestMessageAt.slice(0, 10) : "unknown";
-      if (!byDay[day]) byDay[day] = { conversations: 0, totalMin: 0, slowCount: 0, slowGuests: [] };
-      byDay[day].conversations++;
-      byDay[day].totalMin += r.responseTimeMin;
-      if (r.slow) { byDay[day].slowCount++; byDay[day].slowGuests.push(r.guestName); }
+      if (!byDay[day]) byDay[day] = { total: 0, answered: 0, unanswered: 0, slowCount: 0, totalMin: 0 };
+      byDay[day].total++;
+      if (r.unanswered) byDay[day].unanswered++;
+      else { byDay[day].answered++; byDay[day].totalMin += r.responseTimeMin; }
+      if (r.slow) byDay[day].slowCount++;
     });
     Object.keys(byDay).forEach(d => {
-      byDay[d].avgResponseMin = Math.round(byDay[d].totalMin / byDay[d].conversations);
-      byDay[d].avgResponseHuman = byDay[d].avgResponseMin < 60
-        ? byDay[d].avgResponseMin + " min"
-        : Math.floor(byDay[d].avgResponseMin/60) + "h " + (byDay[d].avgResponseMin%60) + "m";
-      delete byDay[d].totalMin;
+      const b = byDay[d];
+      b.avgResponseHuman = b.answered ? fmt(Math.round(b.totalMin / b.answered)) : "N/A";
+      delete b.totalMin;
     });
 
     return {
       content: [{
         type: "text",
         text: JSON.stringify({
-          period: { from: dateFrom, to: dateTo },
-          conversationsFound:    convos.length,
-          conversationsAnalyzed: sample.length,
-          conversationsWithData: results.length,
+          period:                { from: dateFrom, to: dateTo },
           slowThresholdMin,
-          averageResponseMin:   avgMin,
-          averageResponseHuman: avgMin ? (avgMin < 60 ? avgMin + " min" : Math.floor(avgMin/60) + "h " + (avgMin%60) + "m") : "N/A",
-          slowResponseCount:    results.filter(r => r.slow).length,
-          slowResponses:        results.filter(r => r.slow).map(r => ({ guestName: r.guestName, listingName: r.listingName, responseTimeHuman: r.responseTimeHuman, guestMessageAt: r.guestMessageAt })),
+          conversationsAnalyzed: results.length,
+          answeredCount:         answered.length,
+          unansweredCount:       unanswered.length,
+          slowResponseCount:     slow.length,
+          averageResponseTime:   fmt(avgMin),
           byDay,
+          slowResponses: slow.map(r => ({
+            guestName:         r.guestName,
+            apartmentName:     r.apartmentName,
+            stayCheckIn:       r.stayCheckIn,
+            stayCheckOut:      r.stayCheckOut,
+            guestMessage:      r.guestMessage,
+            guestMessageAt:    r.guestMessageAt,
+            responseTime:      r.responseTimeHuman,
+            unanswered:        r.unanswered || false,
+          })),
+          unansweredGuests: unanswered.map(r => ({
+            guestName:      r.guestName,
+            apartmentName:  r.apartmentName,
+            guestMessage:   r.guestMessage,
+            messageSentAt:  r.guestMessageAt,
+            waitingFor:     fmt(r.waitingMin),
+          })),
           allResults: results,
-          debugSkipped: skipped.slice(0, 3), // show first 3 skipped for diagnosis
         }, null, 2),
       }],
     };
