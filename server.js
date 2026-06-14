@@ -386,19 +386,17 @@ server.tool("get_response_times",
     const from = new Date(dateFrom);
     const to   = new Date(dateTo + "T23:59:59Z");
 
-    const { records: convos } = await smartFetch("/conversations", params, {
-      maxPages: 10,
-      filterFn: (c) => {
-        const d = new Date(c.updatedOn || c.insertedOn);
-        return d >= from && d <= to;
-      },
+    // Fetch recent conversations — NO date filter here because Hostaway's
+    // updatedOn field is unreliable. We fetch the latest 200 and filter by
+    // message timestamps instead.
+    const { records: convos, total: totalConvos } = await smartFetch("/conversations", params, {
+      maxPages: 2, // 200 conversations max — enough for any single day
     });
 
     if (!convos.length) {
       return { content: [{ type: "text", text: JSON.stringify({
-        message: "No conversations found for this period.",
-        dateFrom, dateTo,
-        tip: "Try a broader date range e.g. last 7 days"
+        message: "No conversations found in your Hostaway account.",
+        tip: "Make sure your Hostaway account has inbox messages"
       }) }] };
     }
 
@@ -437,6 +435,13 @@ server.tool("get_response_times",
           }
 
           if (firstGuest && firstHost) {
+            const guestMsgDate = new Date(firstGuest.insertedOn);
+
+            // Only include if guest message falls within requested date range
+            if (guestMsgDate < from || guestMsgDate > to) {
+              return { _skipped: true, _reason: "guest message outside date range", conversationId: convo.id, guestMessageAt: firstGuest.insertedOn };
+            }
+
             const diffMin = Math.round((new Date(firstHost.insertedOn) - new Date(firstGuest.insertedOn)) / 60000);
             return {
               conversationId:   convo.id,
