@@ -371,23 +371,23 @@ server.tool("get_reviews",
 
 // ── GET RESPONSE TIMES ────────────────────────────────────────────────────────
 server.tool("get_response_times",
-  "Analyze how quickly hosts replied to guests. Shows average response time in minutes per conversation, per day, and flags slow responses.",
+  "Analyze how quickly hosts replied to guests. Shows average response time in minutes, breakdown by day, and lists slow responses.",
   {
     dateFrom:         z.string().describe("From date YYYY-MM-DD"),
     dateTo:           z.string().describe("To date YYYY-MM-DD"),
     listingId:        z.number().optional().describe("Filter by listing ID"),
-    slowThresholdMin: z.number().optional().describe("Minutes threshold to flag slow responses, default 60"),
+    slowThresholdMin: z.number().optional().describe("Minutes to flag as slow, default 15"),
+    maxConvos:        z.number().optional().describe("Max conversations to analyze, default 40"),
   },
-  async ({ dateFrom, dateTo, listingId, slowThresholdMin = 60 }) => {
+  async ({ dateFrom, dateTo, listingId, slowThresholdMin = 15, maxConvos = 40 }) => {
     const params = {};
     if (listingId) params.listingId = listingId;
 
     const from = new Date(dateFrom);
     const to   = new Date(dateTo + "T23:59:59Z");
 
-    // Fetch conversations updated in the date range
     const { records: convos } = await smartFetch("/conversations", params, {
-      maxPages: 20,
+      maxPages: 10,
       filterFn: (c) => {
         const d = new Date(c.updatedOn || c.insertedOn);
         return d >= from && d <= to;
@@ -395,68 +395,99 @@ server.tool("get_response_times",
     });
 
     if (!convos.length) {
-      return { content: [{ type: "text", text: JSON.stringify({ message: "No conversations found for this period.", dateFrom, dateTo }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({
+        message: "No conversations found for this period.",
+        dateFrom, dateTo,
+        tip: "Try a broader date range e.g. last 7 days"
+      }) }] };
     }
 
-    // Fetch messages for each conversation (limit to 30 convos to avoid timeout)
-    const sample = convos.slice(0, 30);
+    const sample  = convos.slice(0, maxConvos);
     const results = [];
+    const skipped = [];
 
-    for (const convo of sample) {
-      try {
-        const msgData = await hostawayFetch(`/conversations/${convo.id}/messages`);
-        const messages = (msgData.result || []).sort((a, b) => new Date(a.insertedOn) - new Date(b.insertedOn));
+    // Fetch in parallel batches of 5
+    for (let i = 0; i < sample.length; i += 5) {
+      const batch = sample.slice(i, i + 5);
+      const batchOut = await Promise.all(batch.map(async (convo) => {
+        try {
+          const msgData = await hostawayFetch("/conversations/" + convo.id + "/messages");
+          const raw = msgData.result || [];
+          const messages = raw.sort((a, b) => new Date(a.insertedOn) - new Date(b.insertedOn));
 
-        // Find first guest message then first host reply after it
-        let firstGuestMsg = null;
-        let firstHostReply = null;
+          // Try multiple field names Hostaway might use for sender role
+          const getRole = (msg) => {
+            if (msg.senderRole)  return msg.senderRole;
+            if (msg.type)        return msg.type;
+            if (msg.authorType)  return msg.authorType;
+            if (msg.direction === "incoming") return "guest";
+            if (msg.direction === "outgoing") return "host";
+            if (msg.isOutgoing === false)     return "guest";
+            if (msg.isOutgoing === true)      return "host";
+            return null;
+          };
 
-        for (const msg of messages) {
-          if (!firstGuestMsg && msg.senderRole === "guest") {
-            firstGuestMsg = msg;
-          } else if (firstGuestMsg && !firstHostReply && msg.senderRole === "host") {
-            firstHostReply = msg;
-            break;
+          let firstGuest = null;
+          let firstHost  = null;
+
+          for (const msg of messages) {
+            const role = getRole(msg);
+            if (!firstGuest && role === "guest") { firstGuest = msg; }
+            else if (firstGuest && !firstHost && role === "host") { firstHost = msg; break; }
           }
-        }
 
-        if (firstGuestMsg && firstHostReply) {
-          const guestTime = new Date(firstGuestMsg.insertedOn);
-          const hostTime  = new Date(firstHostReply.insertedOn);
-          const diffMin   = Math.round((hostTime - guestTime) / 60000);
+          if (firstGuest && firstHost) {
+            const diffMin = Math.round((new Date(firstHost.insertedOn) - new Date(firstGuest.insertedOn)) / 60000);
+            return {
+              conversationId:   convo.id,
+              guestName:        convo.guestName,
+              listingName:      convo.listingName,
+              channel:          convo.channelName,
+              guestMessageAt:   firstGuest.insertedOn,
+              hostReplyAt:      firstHost.insertedOn,
+              responseTimeMin:  diffMin,
+              responseTimeHuman: diffMin < 60 ? diffMin + " min" : Math.floor(diffMin/60) + "h " + (diffMin%60) + "m",
+              slow:             diffMin > slowThresholdMin,
+            };
+          }
 
-          results.push({
+          // Debug: return raw sample so we can see the real field names
+          return {
+            _skipped: true,
             conversationId: convo.id,
-            guestName:      convo.guestName,
-            listingName:    convo.listingName,
-            guestMessageAt: firstGuestMsg.insertedOn,
-            hostReplyAt:    firstHostReply.insertedOn,
-            responseTimeMin: diffMin,
-            slow:           diffMin > slowThresholdMin,
-          });
+            guestName: convo.guestName,
+            messageCount: messages.length,
+            sampleMessageFields: raw[0] ? Object.keys(raw[0]) : [],
+            sampleMessage: raw[0] || null,
+          };
+
+        } catch (e) {
+          return { _error: true, conversationId: convo.id, error: e.message };
         }
-      } catch (e) {
-        // skip failed conversations
-      }
+      }));
+
+      batchOut.forEach(r => {
+        if (r && !r._skipped && !r._error) results.push(r);
+        else if (r) skipped.push(r);
+      });
     }
 
-    // Summary stats
-    const times = results.map(r => r.responseTimeMin).filter(t => t >= 0);
+    const times  = results.map(r => r.responseTimeMin).filter(t => t >= 0);
     const avgMin = times.length ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
-    const slowCount = results.filter(r => r.slow).length;
 
-    // Group by day
     const byDay = {};
     results.forEach(r => {
-      const day = r.guestMessageAt?.slice(0, 10);
-      if (!day) return;
-      if (!byDay[day]) byDay[day] = { count: 0, totalMin: 0, slow: 0 };
-      byDay[day].count++;
+      const day = r.guestMessageAt ? r.guestMessageAt.slice(0, 10) : "unknown";
+      if (!byDay[day]) byDay[day] = { conversations: 0, totalMin: 0, slowCount: 0, slowGuests: [] };
+      byDay[day].conversations++;
       byDay[day].totalMin += r.responseTimeMin;
-      if (r.slow) byDay[day].slow++;
+      if (r.slow) { byDay[day].slowCount++; byDay[day].slowGuests.push(r.guestName); }
     });
     Object.keys(byDay).forEach(d => {
-      byDay[d].avgResponseMin = Math.round(byDay[d].totalMin / byDay[d].count);
+      byDay[d].avgResponseMin = Math.round(byDay[d].totalMin / byDay[d].conversations);
+      byDay[d].avgResponseHuman = byDay[d].avgResponseMin < 60
+        ? byDay[d].avgResponseMin + " min"
+        : Math.floor(byDay[d].avgResponseMin/60) + "h " + (byDay[d].avgResponseMin%60) + "m";
       delete byDay[d].totalMin;
     });
 
@@ -465,18 +496,23 @@ server.tool("get_response_times",
         type: "text",
         text: JSON.stringify({
           period: { from: dateFrom, to: dateTo },
-          conversationsAnalyzed: results.length,
+          conversationsFound:    convos.length,
+          conversationsAnalyzed: sample.length,
+          conversationsWithData: results.length,
           slowThresholdMin,
-          averageResponseMin: avgMin,
-          averageResponseHuman: avgMin ? `${Math.floor(avgMin/60)}h ${avgMin%60}m` : "N/A",
-          slowResponseCount: slowCount,
+          averageResponseMin:   avgMin,
+          averageResponseHuman: avgMin ? (avgMin < 60 ? avgMin + " min" : Math.floor(avgMin/60) + "h " + (avgMin%60) + "m") : "N/A",
+          slowResponseCount:    results.filter(r => r.slow).length,
+          slowResponses:        results.filter(r => r.slow).map(r => ({ guestName: r.guestName, listingName: r.listingName, responseTimeHuman: r.responseTimeHuman, guestMessageAt: r.guestMessageAt })),
           byDay,
-          details: results.sort((a, b) => b.responseTimeMin - a.responseTimeMin),
+          allResults: results,
+          debugSkipped: skipped.slice(0, 3), // show first 3 skipped for diagnosis
         }, null, 2),
       }],
     };
   }
 );
+
 
 // ─── EXPRESS ──────────────────────────────────────────────────────────────────
 const app = express();
